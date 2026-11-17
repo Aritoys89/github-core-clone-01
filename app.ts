@@ -157,7 +157,7 @@ interface Repo {
   numberSeq: number; // issues and pull requests share one number sequence
   gidSeq: number;
   commentSeq: number;
-  packCache: Map<string, Buffer>;
+  packCache: Map<string, { pack: Buffer; plan: FetchPlan }>;
 }
 
 const reposByName = new Map<string, Repo>();
@@ -213,7 +213,13 @@ function objectId(type: string, data: Buffer): string {
 }
 
 function storeObject(repo: Repo, type: string, data: Buffer): string {
-  const oid = objectId(type, data);
+  return storeObjectWithId(repo, type, data, objectId(type, data));
+}
+
+// Store an object whose id the caller has already computed (a pack's
+// index pass hashes every plain entry once; resolving must not hash the
+// same bytes a second time to store them).
+function storeObjectWithId(repo: Repo, type: string, data: Buffer, oid: string): string {
   if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
   return oid;
 }
@@ -741,6 +747,7 @@ interface PackEntry {
   baseOid?: string;
   baseOffset?: number;
   entryStart: number;
+  oid?: string; // a plain entry's id, computed by the index pass when one runs
 }
 
 // Read a pack into the repo's store; returns the oids it carried.
@@ -802,13 +809,21 @@ function readPack(repo: Repo, pack: Buffer): string[] {
   }
   // Index the plain entries by object id once, so a REF_DELTA base lookup
   // is a single map hit instead of a rescan that rehashes every candidate
-  // entry for every delta in the pack.
+  // entry for every delta in the pack. The index exists only for those
+  // lookups: a pack carrying no REF_DELTA never consults it, so building
+  // it there would hash every object for nothing. When the index does
+  // run, each plain entry keeps the id it computed, and resolving stores
+  // through it instead of hashing the same bytes again.
   const indexByOid = new Map<string, number>();
-  entries.forEach((entry, index) => {
-    if (entry.data !== undefined) {
-      indexByOid.set(objectId(entry.type, entry.data), index);
-    }
-  });
+  if (entries.some((entry) => entry.baseOid !== undefined)) {
+    entries.forEach((entry, index) => {
+      if (entry.data !== undefined) {
+        const oid = objectId(entry.type, entry.data);
+        entry.oid = oid;
+        indexByOid.set(oid, index);
+      }
+    });
+  }
   // Resolve entries (deltas may chain) and store every object.
   const resolved: (string | null)[] = entries.map(() => null);
   const resolve = (index: number, depth: number): string => {
@@ -818,7 +833,10 @@ function readPack(repo: Repo, pack: Buffer): string[] {
     const entry = entries[index];
     let oid: string;
     if (entry.data !== undefined) {
-      oid = storeObject(repo, entry.type, entry.data);
+      oid =
+        entry.oid !== undefined
+          ? storeObjectWithId(repo, entry.type, entry.data, entry.oid)
+          : storeObject(repo, entry.type, entry.data);
     } else {
       let baseType: string;
       let baseData: Buffer;
@@ -972,12 +990,18 @@ function packForFetch(
     depth === null ? 'full' : String(depth),
     [...clientShallow].sort().join(','),
   ].join('|');
-  const plan = planFetch(repo, wants, haves, depth, clientShallow);
+  // The plan is a pure function of the key's inputs and the store the key
+  // was computed against, and touchRepo empties this cache on every
+  // mutation, so a hit can hand back the plan alongside the pack instead
+  // of walking the history again to rebuild an identical one. Callers
+  // only read the plan's arrays, never mutate them.
   const cached = repo.packCache.get(key);
-  if (cached) return { pack: cached, plan };
+  if (cached) return cached;
+  const plan = planFetch(repo, wants, haves, depth, clientShallow);
   const pack = buildPack(repo, plan.oids);
-  repo.packCache.set(key, pack);
-  return { pack, plan };
+  const entry = { pack, plan };
+  repo.packCache.set(key, entry);
+  return entry;
 }
 
 // ---------------------------------------------------------------------------
@@ -1060,9 +1084,21 @@ function sidebandPackets(data: Buffer, band: number): Buffer[] {
 
 let requestSeq = 0;
 
+// The timestamp half of a request id, memoized per millisecond: the
+// clock is still read on every call, and a reading that differs from
+// the last one is converted fresh, so the values handed out are exactly
+// the ones an unmemoized conversion would produce.
+let lastIdMs = -1;
+let lastIdMs36 = '';
+
 function requestId(): string {
   requestSeq += 1;
-  return `forge-${requestSeq.toString(36)}-${Date.now().toString(36)}`;
+  const now = Date.now();
+  if (now !== lastIdMs) {
+    lastIdMs = now;
+    lastIdMs36 = now.toString(36);
+  }
+  return `forge-${requestSeq.toString(36)}-${lastIdMs36}`;
 }
 
 function expectedToken(): string {
@@ -2077,13 +2113,16 @@ function restMergePull(ctx: RestContext, repo: Repo, pull: PullRec): void {
 
 // --- REST dispatcher --------------------------------------------------------
 
-async function handleRest(
+// Synchronous by design: no step in REST dispatch or in any handler it
+// routes to ever awaits, so declaring this async would only wrap every
+// request's work in a promise nobody needs.
+function handleRest(
   req: IncomingMessage,
   res: ServerResponse,
   segments: string[],
   url: URL,
   rawBody: Buffer,
-): Promise<void> {
+): void {
   // segments[0..1] are 'api' and 'v3'; the rest routes from there.
   const parts = segments.slice(2);
   let body: Record<string, unknown> = {};
@@ -4108,10 +4147,12 @@ export function createApp(): Server {
     void (async () => {
       try {
         const url = new URL(req.url ?? '/', 'http://forge.invalid');
-        const segments = url.pathname
-          .split('/')
-          .filter((s) => s.length > 0)
-          .map(decodeSegment);
+        // The path's non-empty segments, decoded: one pass over the
+        // split instead of a filter and a map chained behind it.
+        const segments: string[] = [];
+        for (const rawSegment of url.pathname.split('/')) {
+          if (rawSegment.length > 0) segments.push(decodeSegment(rawSegment));
+        }
         if (url.pathname === '/healthz' || url.pathname === '/healthz/') {
           sendJson(res, 200, { ok: true });
           return;
@@ -4143,7 +4184,7 @@ export function createApp(): Server {
         }
         if (segments[0] === 'api' && segments[1] === 'v3') {
           const rawBody = requestMayHaveBody(req) ? await readBody(req) : EMPTY_BODY;
-          await handleRest(req, res, segments, url, rawBody);
+          handleRest(req, res, segments, url, rawBody);
           return;
         }
         if (url.pathname === '/api/graphql' || url.pathname === '/api/graphql/') {
