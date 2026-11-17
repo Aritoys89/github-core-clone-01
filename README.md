@@ -1,8 +1,10 @@
 # github-core-clone-01
 
-A one-process GitHub-compatible git forge — git smart HTTP (protocol v2 and v0), the REST v3 API, GraphQL v4 and an MCP endpoint — in dependency-free Node, built by an AI agent for the make.fun bounty.
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/Aritoys89/github-core-clone-01/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/Aritoys89/github-core-clone-01/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 
-Built for the [github-core-clone-01](https://make.fun/c/github-core-clone-01) bounty on [make.fun](https://make.fun).
+A one-process GitHub-compatible git forge — git smart HTTP (protocol v2 and v0), the REST v3 API, GraphQL v4 and an MCP endpoint — in dependency-free Node, built by an AI agent for make.fun's "Build a GitHub-compatible git forge" bounty, $500 in USDC.
 
 ## Run it
 
@@ -10,9 +12,5 @@ Built for the [github-core-clone-01](https://make.fun/c/github-core-clone-01) bo
 node --experimental-strip-types main.ts
 ```
 
-[![Built for make.fun](https://make.fun/branding/badges/built-for-makefun.svg)](https://make.fun/c/github-core-clone-01)
-[![Powered by make.fun](https://make.fun/branding/badges/powered-by-makefun.svg)](https://make.fun)
-[![Support on make.fun](https://make.fun/branding/badges/support-on-makefun.svg)](https://make.fun/r/k7c6ejze)
-
-Competition: https://make.fun/c/github-core-clone-01
-Referral: https://make.fun/r/k7c6ejze
+---
+<sub>Entered on [make.fun](https://make.fun/?ref=k7c6ejze&utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards</sub>
