@@ -1423,14 +1423,23 @@ function pullJson(req: IncomingMessage, repo: Repo, pull: PullRec): Record<strin
 // REST v3 handlers
 // ---------------------------------------------------------------------------
 
+// The slice of a parsed request target the handlers actually read: the
+// raw path and the decoded query parameters. A WHATWG URL satisfies this
+// structurally, and the dispatcher also builds it directly from the raw
+// target for the common shapes (see parseRequestTarget in createApp).
+interface RequestUrl {
+  pathname: string;
+  searchParams: URLSearchParams;
+}
+
 interface RestContext {
   req: IncomingMessage;
   res: ServerResponse;
-  url: URL;
+  url: RequestUrl;
   body: Record<string, unknown>;
 }
 
-function pageParams(url: URL): { page: number; perPage: number } {
+function pageParams(url: RequestUrl): { page: number; perPage: number } {
   const page = Math.max(1, Number(url.searchParams.get('page') ?? '1') || 1);
   const perPage = Math.min(
     100,
@@ -2120,7 +2129,7 @@ function handleRest(
   req: IncomingMessage,
   res: ServerResponse,
   segments: string[],
-  url: URL,
+  url: RequestUrl,
   rawBody: Buffer,
 ): void {
   // segments[0..1] are 'api' and 'v3'; the rest routes from there.
@@ -2346,7 +2355,7 @@ function handleInfoRefs(
   req: IncomingMessage,
   res: ServerResponse,
   repo: Repo,
-  url: URL,
+  url: RequestUrl,
 ): void {
   const service = url.searchParams.get('service');
   if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
@@ -2631,13 +2640,35 @@ function handleReceivePack(res: ServerResponse, repo: Repo, body: Buffer): void 
   res.end(payload);
 }
 
+// The info/refs exchange is answered without reading a request body,
+// so it runs synchronously; the dispatcher calls this directly instead
+// of going through the async handleGit below.
+function handleGitInfoRefs(
+  req: IncomingMessage,
+  res: ServerResponse,
+  owner: string,
+  repoName: string,
+  url: RequestUrl,
+): void {
+  if (!authorized(req)) {
+    badCredentials(res);
+    return;
+  }
+  const repo = findRepo(owner, repoName);
+  if (!repo) {
+    notFound(res);
+    return;
+  }
+  handleInfoRefs(req, res, repo, url);
+}
+
 async function handleGit(
   req: IncomingMessage,
   res: ServerResponse,
   owner: string,
   repoName: string,
   action: string,
-  url: URL,
+  url: RequestUrl,
 ): Promise<void> {
   if (!authorized(req)) {
     badCredentials(res);
@@ -4142,72 +4173,158 @@ function requestMayHaveBody(req: IncomingMessage): boolean {
   return req.headers['transfer-encoding'] !== undefined;
 }
 
+// Characters that make the WHATWG URL parser rewrite a request target:
+// escapes it resolves or re-encodes, fragment and backslash handling,
+// and the characters it percent-encodes in a path. A target containing
+// any of them (or a dot segment, or a leading "//" the parser would
+// read as an authority) takes the full URL parse below; anything else
+// splits into path and query exactly as the parser would report them,
+// so the split can be done by hand and no URL object is allocated.
+const URL_FALLBACK_CHARS = '%#\\"<>^`{}';
+
+function parseRequestTarget(raw: string): RequestUrl {
+  let manual = raw.startsWith('/') && raw[1] !== '/';
+  if (manual) {
+    for (let i = 0; i < raw.length; i += 1) {
+      const code = raw.charCodeAt(i);
+      if (code <= 0x20 || code === 0x7f || URL_FALLBACK_CHARS.includes(raw[i])) {
+        manual = false;
+        break;
+      }
+    }
+  }
+  if (manual) {
+    const q = raw.indexOf('?');
+    const pathname = q === -1 ? raw : raw.slice(0, q);
+    for (const segment of pathname.split('/')) {
+      if (segment === '.' || segment === '..') {
+        manual = false;
+        break;
+      }
+    }
+    if (manual) {
+      return {
+        pathname,
+        searchParams: new URLSearchParams(q === -1 ? '' : raw.slice(q + 1)),
+      };
+    }
+  }
+  return new URL(raw, 'http://forge.invalid');
+}
+
+// The dispatcher's one failure answer: a 500 before anything was sent,
+// a bare end once the response is already under way.
+function failRequest(res: ServerResponse): void {
+  if (!res.headersSent) {
+    sendJson(res, 500, { message: 'Internal Server Error' });
+  } else {
+    res.end();
+  }
+}
+
 export function createApp(): Server {
   const server = createServer((req, res) => {
-    void (async () => {
-      try {
-        const url = new URL(req.url ?? '/', 'http://forge.invalid');
-        // The path's non-empty segments, decoded: one pass over the
-        // split instead of a filter and a map chained behind it.
-        const segments: string[] = [];
-        for (const rawSegment of url.pathname.split('/')) {
-          if (rawSegment.length > 0) segments.push(decodeSegment(rawSegment));
-        }
-        if (url.pathname === '/healthz' || url.pathname === '/healthz/') {
-          sendJson(res, 200, { ok: true });
-          return;
-        }
-        // Git smart HTTP: /<owner>/<repo>.git/<action>, where the action
-        // is git-upload-pack, git-receive-pack or the two-segment
-        // info/refs.
-        const gitAction =
-          segments.length === 3 &&
-          segments[1].endsWith('.git') &&
-          (segments[2] === 'git-upload-pack' || segments[2] === 'git-receive-pack')
-            ? segments[2]
-            : segments.length === 4 &&
-                segments[1].endsWith('.git') &&
-                segments[2] === 'info' &&
-                segments[3] === 'refs'
-              ? 'info/refs'
-              : null;
-        if (gitAction !== null) {
-          await handleGit(
-            req,
-            res,
-            segments[0],
-            segments[1].slice(0, -'.git'.length),
-            gitAction,
-            url,
-          );
-          return;
-        }
-        if (segments[0] === 'api' && segments[1] === 'v3') {
-          const rawBody = requestMayHaveBody(req) ? await readBody(req) : EMPTY_BODY;
-          handleRest(req, res, segments, url, rawBody);
-          return;
-        }
-        if (url.pathname === '/api/graphql' || url.pathname === '/api/graphql/') {
-          const rawBody = await readBody(req);
-          await handleGraphql(req, res, rawBody);
-          return;
-        }
-        if (url.pathname === '/mcp' || url.pathname === '/mcp/') {
-          const rawBody = await readBody(req);
-          await handleMcp(req, res, rawBody);
-          return;
-        }
-        // Drain any request body before answering unknown routes.
-        await readBody(req).catch(() => Buffer.alloc(0));
-        notFound(res);
-      } catch {
-        if (!res.headersSent) {
-          sendJson(res, 500, { message: 'Internal Server Error' });
-        } else {
-          res.end();
-        }
+    try {
+      const url = parseRequestTarget(req.url ?? '/');
+      // The path's non-empty segments, decoded: one pass over the
+      // split instead of a filter and a map chained behind it.
+      const segments: string[] = [];
+      for (const rawSegment of url.pathname.split('/')) {
+        if (rawSegment.length > 0) segments.push(decodeSegment(rawSegment));
       }
-    })();
+      if (url.pathname === '/healthz' || url.pathname === '/healthz/') {
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+      // Git smart HTTP: /<owner>/<repo>.git/<action>, where the action
+      // is git-upload-pack, git-receive-pack or the two-segment
+      // info/refs.
+      const gitAction =
+        segments.length === 3 &&
+        segments[1].endsWith('.git') &&
+        (segments[2] === 'git-upload-pack' || segments[2] === 'git-receive-pack')
+          ? segments[2]
+          : segments.length === 4 &&
+              segments[1].endsWith('.git') &&
+              segments[2] === 'info' &&
+              segments[3] === 'refs'
+            ? 'info/refs'
+            : null;
+      if (gitAction !== null) {
+        const owner = segments[0];
+        const repoName = segments[1].slice(0, -'.git'.length);
+        if (gitAction === 'info/refs') {
+          // Answered without reading a body: run it synchronously
+          // instead of through the async handler's promise.
+          handleGitInfoRefs(req, res, owner, repoName, url);
+        } else {
+          void handleGit(req, res, owner, repoName, gitAction, url).catch(() =>
+            failRequest(res),
+          );
+        }
+        return;
+      }
+      if (segments[0] === 'api' && segments[1] === 'v3') {
+        if (!requestMayHaveBody(req)) {
+          // The common read: no body to wait for, so the handler runs
+          // and answers inside this tick, no promise involved.
+          handleRest(req, res, segments, url, EMPTY_BODY);
+        } else {
+          void readBody(req).then(
+            (rawBody) => {
+              try {
+                handleRest(req, res, segments, url, rawBody);
+              } catch {
+                failRequest(res);
+              }
+            },
+            () => failRequest(res),
+          );
+        }
+        return;
+      }
+      if (url.pathname === '/api/graphql' || url.pathname === '/api/graphql/') {
+        void (async () => {
+          try {
+            const rawBody = await readBody(req);
+            await handleGraphql(req, res, rawBody);
+          } catch {
+            failRequest(res);
+          }
+        })();
+        return;
+      }
+      if (url.pathname === '/mcp' || url.pathname === '/mcp/') {
+        void (async () => {
+          try {
+            const rawBody = await readBody(req);
+            await handleMcp(req, res, rawBody);
+          } catch {
+            failRequest(res);
+          }
+        })();
+        return;
+      }
+      // Drain any request body before answering unknown routes.
+      void readBody(req).then(
+        () => {
+          try {
+            notFound(res);
+          } catch {
+            failRequest(res);
+          }
+        },
+        () => {
+          try {
+            notFound(res);
+          } catch {
+            failRequest(res);
+          }
+        },
+      );
+    } catch {
+      failRequest(res);
+    }
   });
   server.keepAliveTimeout = 75000;
   server.headersTimeout = 80000;
