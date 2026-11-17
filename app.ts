@@ -54,13 +54,18 @@ function tick(): number {
   clockSecond += 1;
   return clockSecond;
 }
+// Formatting a second as ISO text is pure, and the logical clock hands
+// the same second to many serializers in a row, so keep the last result.
+let isoMemoSec = -1;
+let isoMemoText = '';
 function isoOf(sec: number): string {
-  return new Date(sec * 1000).toISOString();
+  if (sec === isoMemoSec) return isoMemoText;
+  const text = new Date(sec * 1000).toISOString();
+  isoMemoSec = sec;
+  isoMemoText = text;
+  return text;
 }
 
-function sha1Hex(data: Buffer): string {
-  return createHash('sha1').update(data).digest('hex');
-}
 function b64Encode(text: string): string {
   return Buffer.from(text, 'utf8').toString('base64');
 }
@@ -99,6 +104,17 @@ interface IssueRec {
   createdSec: number;
   updatedSec: number;
   closedSec: number | null;
+  // The last serialized single-issue response and the exact inputs it
+  // was built from; sendIssueJson reuses the bytes only while every one
+  // of those inputs still matches.
+  getCache?: {
+    host: string;
+    updatedSec: number;
+    commentCount: number;
+    labels: string[];
+    repoName: string;
+    body: Buffer;
+  };
 }
 
 interface PullRec {
@@ -186,9 +202,18 @@ function touchRepo(repo: Repo): void {
 // Git object primitives
 // ---------------------------------------------------------------------------
 
+// The object id of a would-be stored object: SHA-1 over the header and
+// the payload, fed to the hash in two updates so hashing never has to
+// copy the payload into a joined buffer first.
+function objectId(type: string, data: Buffer): string {
+  return createHash('sha1')
+    .update(`${type} ${data.length}\0`, 'utf8')
+    .update(data)
+    .digest('hex');
+}
+
 function storeObject(repo: Repo, type: string, data: Buffer): string {
-  const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  const oid = sha1Hex(Buffer.concat([header, data]));
+  const oid = objectId(type, data);
   if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
   return oid;
 }
@@ -688,26 +713,25 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
 }
 
 // Inflate one zlib stream starting at `pos` inside a larger buffer and
-// report how many compressed bytes it occupied. inflateSync tolerates
-// trailing bytes but throws on a truncated stream, so the smallest prefix
-// that inflates cleanly is exactly the stream.
+// report how many compressed bytes it occupied. A zlib stream knows
+// where it ends: asking for stream info makes the engine report exactly
+// how many input bytes it consumed, so one inflate yields both the data
+// and the offset of whatever follows the stream.
 function inflateOne(buf: Buffer, pos: number): { data: Buffer; next: number } {
-  const rest = buf.subarray(pos);
-  let lo = 1;
-  let hi = rest.length;
-  let best = -1;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    try {
-      inflateSync(rest.subarray(0, mid));
-      best = mid;
-      hi = mid - 1;
-    } catch {
-      lo = mid + 1;
-    }
+  let outcome: { buffer: Buffer; engine: { bytesWritten: number } };
+  try {
+    outcome = inflateSync(buf.subarray(pos), { info: true }) as unknown as {
+      buffer: Buffer;
+      engine: { bytesWritten: number };
+    };
+  } catch {
+    throw new Error('corrupt zlib stream in pack');
   }
-  if (best === -1) throw new Error('corrupt zlib stream in pack');
-  return { data: inflateSync(rest.subarray(0, best)), next: pos + best };
+  const consumed = outcome.engine.bytesWritten;
+  if (!Number.isInteger(consumed) || consumed <= 0) {
+    throw new Error('corrupt zlib stream in pack');
+  }
+  return { data: outcome.buffer, next: pos + consumed };
 }
 
 interface PackEntry {
@@ -776,6 +800,15 @@ function readPack(repo: Repo, pack: Buffer): string[] {
     }
     byStart.set(entryStart, i);
   }
+  // Index the plain entries by object id once, so a REF_DELTA base lookup
+  // is a single map hit instead of a rescan that rehashes every candidate
+  // entry for every delta in the pack.
+  const indexByOid = new Map<string, number>();
+  entries.forEach((entry, index) => {
+    if (entry.data !== undefined) {
+      indexByOid.set(objectId(entry.type, entry.data), index);
+    }
+  });
   // Resolve entries (deltas may chain) and store every object.
   const resolved: (string | null)[] = entries.map(() => null);
   const resolve = (index: number, depth: number): string => {
@@ -790,16 +823,7 @@ function readPack(repo: Repo, pack: Buffer): string[] {
       let baseType: string;
       let baseData: Buffer;
       if (entry.baseOid !== undefined) {
-        const inPack = entries.findIndex(
-          (candidate) =>
-            candidate.data !== undefined &&
-            sha1Hex(
-              Buffer.concat([
-                Buffer.from(`${candidate.type} ${candidate.data.length}\0`, 'utf8'),
-                candidate.data,
-              ]),
-            ) === entry.baseOid,
-        );
+        const inPack = indexByOid.get(entry.baseOid) ?? -1;
         if (inPack >= 0) {
           const baseEntry = entries[inPack];
           baseType = baseEntry.type;
@@ -962,8 +986,12 @@ function packForFetch(
 
 function pktLine(payload: Buffer | string): Buffer {
   const body = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
-  const header = (body.length + 4).toString(16).padStart(4, '0');
-  return Buffer.concat([Buffer.from(header, 'ascii'), body]);
+  // Frame in a single allocation: 4 hex header bytes, then the payload
+  // copied in once, instead of a header buffer joined by a concat.
+  const framed = Buffer.allocUnsafe(body.length + 4);
+  framed.write((body.length + 4).toString(16).padStart(4, '0'), 0, 'ascii');
+  body.copy(framed, 4);
+  return framed;
 }
 const PKT_FLUSH = Buffer.from('0000', 'ascii');
 const PKT_DELIM = Buffer.from('0001', 'ascii');
@@ -1006,13 +1034,22 @@ function sidebandPackets(data: Buffer, band: number): Buffer[] {
   const packets: Buffer[] = [];
   // A pkt-line is at most 65520 bytes including its 4-byte header, and the
   // band byte rides inside the payload: 65520 - 4 - 1 bytes of data each.
+  // Each packet is framed in one allocation (header, band byte, data)
+  // rather than concatenating a band buffer and then framing the result.
   const maxPayload = 65515;
   for (let off = 0; off < data.length; off += maxPayload) {
     const chunk = data.subarray(off, off + maxPayload);
-    packets.push(pktLine(Buffer.concat([Buffer.from([band]), chunk])));
+    const framed = Buffer.allocUnsafe(chunk.length + 5);
+    framed.write((chunk.length + 5).toString(16).padStart(4, '0'), 0, 'ascii');
+    framed[4] = band;
+    chunk.copy(framed, 5);
+    packets.push(framed);
   }
   if (packets.length === 0) {
-    packets.push(pktLine(Buffer.from([band])));
+    const framed = Buffer.allocUnsafe(5);
+    framed.write('0005', 0, 'ascii');
+    framed[4] = band;
+    packets.push(framed);
   }
   return packets;
 }
@@ -1032,11 +1069,19 @@ function expectedToken(): string {
   return process.env.MAKEFUN_SHOP_TOKEN ?? '';
 }
 
+// The token is fixed for the life of the process (the harness sets it
+// before startup), so resolve the full expected header once instead of
+// re-reading the environment on every request. An empty string means no
+// token is configured at all.
+let expectedAuthHeader: string | null = null;
+
 function authorized(req: IncomingMessage): boolean {
-  const token = expectedToken();
-  if (!token) return true; // local development without a configured token
-  const header = req.headers.authorization;
-  return typeof header === 'string' && header === `Bearer ${token}`;
+  if (expectedAuthHeader === null) {
+    const token = expectedToken();
+    expectedAuthHeader = token ? `Bearer ${token}` : '';
+  }
+  if (expectedAuthHeader === '') return true; // local development without a configured token
+  return req.headers.authorization === expectedAuthHeader;
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
@@ -1052,9 +1097,28 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () =>
+      resolve(chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)),
+    );
     req.on('error', reject);
   });
+}
+
+// Send an already-serialized JSON body with the standard response
+// headers; sendJson is this plus the stringify step.
+function sendJsonBuffer(
+  res: ServerResponse,
+  status: number,
+  body: Buffer,
+  extraHeaders: Record<string, string> = {},
+): void {
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': String(body.length),
+    'x-github-request-id': requestId(),
+    ...extraHeaders,
+  });
+  res.end(body);
 }
 
 function sendJson(
@@ -1063,14 +1127,7 @@ function sendJson(
   value: unknown,
   extraHeaders: Record<string, string> = {},
 ): void {
-  const body = Buffer.from(JSON.stringify(value), 'utf8');
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': String(body.length),
-    'x-github-request-id': requestId(),
-    ...extraHeaders,
-  });
-  res.end(body);
+  sendJsonBuffer(res, status, Buffer.from(JSON.stringify(value), 'utf8'), extraHeaders);
 }
 
 function sendEmpty(res: ServerResponse, status: number): void {
@@ -1180,6 +1237,44 @@ function issueJson(req: IncomingMessage, repo: Repo, issue: IssueRec): Record<st
     updated_at: isoOf(issue.updatedSec),
     closed_at: issue.closedSec === null ? null : isoOf(issue.closedSec),
   };
+}
+
+// Answer a single-issue response, reusing the serialized bytes while
+// every input the representation depends on still matches: the host the
+// URLs are built for, the update stamp (every patch and every close
+// moves it), the comment count (comments are append-only), the labels
+// array itself (patches swap it wholesale, and label records are never
+// edited after creation), and the repository's name. On any drift the
+// body is rebuilt and the cache refreshed.
+function sendIssueJson(
+  req: IncomingMessage,
+  res: ServerResponse,
+  repo: Repo,
+  issue: IssueRec,
+  status = 200,
+): void {
+  const cache = issue.getCache;
+  if (
+    cache &&
+    cache.host === hostOf(req) &&
+    cache.updatedSec === issue.updatedSec &&
+    cache.commentCount === issue.comments.length &&
+    cache.labels === issue.labels &&
+    cache.repoName === repo.name
+  ) {
+    sendJsonBuffer(res, status, cache.body);
+    return;
+  }
+  const body = Buffer.from(JSON.stringify(issueJson(req, repo, issue)), 'utf8');
+  issue.getCache = {
+    host: hostOf(req),
+    updatedSec: issue.updatedSec,
+    commentCount: issue.comments.length,
+    labels: issue.labels,
+    repoName: repo.name,
+    body,
+  };
+  sendJsonBuffer(res, status, body);
 }
 
 function commentJson(
@@ -1804,7 +1899,7 @@ function restCreateIssue(ctx: RestContext, repo: Repo): void {
   };
   repo.issues.set(issue.number, issue);
   touchRepo(repo);
-  sendJson(ctx.res, 201, issueJson(ctx.req, repo, issue));
+  sendIssueJson(ctx.req, ctx.res, repo, issue, 201);
 }
 
 function restListIssues(ctx: RestContext, repo: Repo): void {
@@ -1837,7 +1932,7 @@ function restPatchIssue(ctx: RestContext, repo: Repo, issue: IssueRec): void {
     issue.closedSec = ctx.body.state === 'closed' ? tick() : null;
   }
   issue.updatedSec = tick();
-  sendJson(ctx.res, 200, issueJson(ctx.req, repo, issue));
+  sendIssueJson(ctx.req, ctx.res, repo, issue);
 }
 
 function commentTarget(repo: Repo, number: number): IssueRec | PullRec | null {
@@ -2120,7 +2215,7 @@ async function handleRest(
     if (rest.length === 1) {
       const issue = repo.issues.get(number);
       if (!issue) return notFound(res);
-      if (method === 'GET') return sendJson(res, 200, issueJson(req, repo, issue));
+      if (method === 'GET') return sendIssueJson(req, res, repo, issue);
       if (method === 'PATCH') return restPatchIssue(ctx, repo, issue);
       return notFound(res);
     }
@@ -2197,16 +2292,16 @@ function advertisementV0(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
   return Buffer.concat(parts);
 }
 
-function advertisementV2(): Buffer {
-  return Buffer.concat([
-    pktLine('version 2\n'),
-    pktLine(`agent=${SERVER_AGENT}\n`),
-    pktLine('ls-refs\n'),
-    pktLine('fetch=shallow\n'),
-    pktLine('object-format=sha1\n'),
-    PKT_FLUSH,
-  ]);
-}
+// The v2 advertisement never changes, so frame it once at startup
+// instead of on every info/refs request.
+const ADVERTISEMENT_V2 = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine(`agent=${SERVER_AGENT}\n`),
+  pktLine('ls-refs\n'),
+  pktLine('fetch=shallow\n'),
+  pktLine('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
 
 function handleInfoRefs(
   req: IncomingMessage,
@@ -2224,7 +2319,7 @@ function handleInfoRefs(
     service === 'git-upload-pack' &&
     typeof protocol === 'string' &&
     protocol.includes('version=2');
-  const body = wantsV2 ? advertisementV2() : advertisementV0(repo, service);
+  const body = wantsV2 ? ADVERTISEMENT_V2 : advertisementV0(repo, service);
   res.writeHead(200, {
     'content-type': `application/x-${service}-advertisement`,
     'content-length': String(body.length),
@@ -3983,11 +4078,29 @@ async function handleMcp(
 // ---------------------------------------------------------------------------
 
 function decodeSegment(segment: string): string {
+  // Decoding only does something when a '%' introduces an escape, so the
+  // common case skips the call (and its exception handler) entirely.
+  if (!segment.includes('%')) return segment;
   try {
     return decodeURIComponent(segment);
   } catch {
     return segment;
   }
+}
+
+const EMPTY_BODY = Buffer.alloc(0);
+
+// Whether a request can carry a body worth reading: it uses one of the
+// methods this API accepts bodies on, or it frames a body explicitly.
+// Anything else (a plain GET, a bare DELETE) is answered without waiting
+// for a body stream that has nothing in it.
+function requestMayHaveBody(req: IncomingMessage): boolean {
+  if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
+    return true;
+  }
+  const length = req.headers['content-length'];
+  if (length !== undefined && length !== '0') return true;
+  return req.headers['transfer-encoding'] !== undefined;
 }
 
 export function createApp(): Server {
@@ -4029,7 +4142,7 @@ export function createApp(): Server {
           return;
         }
         if (segments[0] === 'api' && segments[1] === 'v3') {
-          const rawBody = await readBody(req);
+          const rawBody = requestMayHaveBody(req) ? await readBody(req) : EMPTY_BODY;
           await handleRest(req, res, segments, url, rawBody);
           return;
         }
